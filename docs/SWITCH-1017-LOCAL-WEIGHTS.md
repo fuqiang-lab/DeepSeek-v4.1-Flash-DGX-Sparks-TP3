@@ -182,6 +182,35 @@ node3  同 workload          ：2405–2424 MHz（上限 3003）
   合成步时 ≈ 2.3× —— 与实测的 ~2× 回退吻合。
 - **待做**：head 断电 30–60 s（软重启可能清不掉）后重跑 bench，预期单流回到 35–40 tok/s。
 
+#### 7.1.1 复现与判定（2026-10-18 07:50 复查）
+
+5.5 小时后仍复现：head 在 95% 利用率下 **507 MHz / 507 MHz（gr）/ 9.2 W**，
+node3 同 workload **2411 MHz / 12.9 W**。
+
+判定依据，以及一条被撤回的论据：
+
+| 观察 | 含义 |
+|---|---|
+| 负载下 head 507 MHz，worker 2411 MHz | 同一 workload、同一驱动/内核，**只有 head** 不升频 |
+| 功率随频率变化（head 9.5 W vs worker 12–31 W） | **不是 NVML 读数冻结**，是真停在低 P-state |
+| 空闲 52 ℃、无 `sw_power_cap` / thermal 标志 / Xid | 排除温度与显式节流 |
+| `-lgc 3003` 后 node3 也只有 2411 | ⚠️ 该平台上 `-lgc` 未必是"强制锁频"，所以**"lgc 无效"不能当证据**；真正的判据是"负载下 head vs worker 的频率差" |
+
+**最可能的触发**（按可能性；需在重启后用上一次启动的日志确认）：
+
+1. **停机窗口内自动挂起/恢复**：本轮 `stop`（01:29）到 `serve`（01:44）之间机器空闲 15 分钟，
+   head 又是带图形会话的机器。GB10 上挂起/恢复后 DVFS 状态丢失、停在最低 P-state 是已知模式。
+   查：`journalctl -b -1 | grep -iE "suspend|PM: suspend|resume"`。
+2. **驱动热重载**（更新/ unattended-upgrade / dkms 重建后未做 GPU 复位）：
+   查：`journalctl -b -1 | grep -iE "NVRM|nvidia"`。
+3. **供电协商降档**（适配器/PD 协商到低预算，固件把时钟夹在最低档）。
+
+**预防**：head 作为常驻服务机不应自动挂起 ——
+`sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target`。
+
+**体检脚本**：`scripts/check-gpu-clocks.sh`（在 head 上跑，发 400-token 负载并按节点采样，
+util ≥ 50% 且中位时钟 < 1200 MHz 判为锁频）。重启后先跑它，再跑 bench。
+
 ### 7.2 次因：k=5 vs k=3 的口径不可比
 
 - 09-25 那张表是 **k=3 时代**（`DSPARK_BLOCK_SIZE=3`，4-token 验证窗）；
