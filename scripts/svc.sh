@@ -98,11 +98,14 @@ preflight() {
 
 # =============================================================================
 do_share() {
-  hr; echo "${c_b}[2/5] share（NFS 权重导出）${c_0}"
-  out=$(timeout 600 ./start.sh share 2>&1)
-  n=$(echo "$out" | grep -c 'dsv41-weights has config.json')
-  [ "${n:-0}" -ge 2 ] && ok "两个 worker 都看到 config.json（$n/2）" \
-    || { echo "$out" | tail -6; die "share 失败（worker 卷陈旧时先在 worker 上 docker volume rm -f dsv41-weights 再 share）"; }
+  local mode="${WEIGHT_MODE:-nfs}" label
+  if [ "$mode" = "local" ]; then label="本地权重同步"; else label="NFS 权重导出"; fi
+  hr; echo "${c_b}[2/5] share（$label）${c_0}"
+  # local 模式首次要把 476 GiB rsync 到每台 worker，默认给 1 小时
+  out=$(timeout "${SHARE_TIMEOUT:-3600}" ./start.sh share 2>&1)
+  n=$(echo "$out" | grep -cE 'dsv41-weights has config.json|local checkpoint (already )?complete')
+  [ "${n:-0}" -ge 2 ] && ok "两个 worker 权重就绪（$n/2）" \
+    || { echo "$out" | tail -8; die "share 失败（NFS 模式：worker 卷陈旧时先 docker volume rm -f dsv41-weights；local 模式：重跑 ./start.sh sync 续传）"; }
 }
 
 # =============================================================================

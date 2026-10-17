@@ -229,6 +229,12 @@ cp env.example .env            # 按需修改 IP/HCA/内存水位
 #   本次实测就绪 497–617 s（约 8–10 分钟）；svc.sh 自带提示写 13–15 分钟，偏保守
 #   其余子命令：./svc.sh status（只读体检）｜stop｜restart｜preflight｜logs -f
 #   开机自启已启用：systemd 单元 dsv41.service → scripts/svc-boot.sh
+#
+# 权重分发有两种模式（.env 的 WEIGHT_MODE）：
+#   nfs   （历史默认）worker 经 NFSv4 读 head 的 checkpoint
+#   local 每台各存一份（476 GiB/台），worker 只读本地 NVMe，运行期无 NFS
+#         —— 首次 ./start.sh share 会用 rsync 经 RoCE 织网分发（约 30 分钟）
+#         实测 worker 加载 445/413 s → 211/194 s；见 docs/SWITCH-1017-LOCAL-WEIGHTS.md
 
 # 3) 三层验证（缺一不可）
 curl -s http://127.0.0.1:8888/health -w " %{http_code}\n"                      # 200
@@ -256,6 +262,16 @@ python3 scripts/bench_migration.py http://192.168.0.86:8888 smoke . 3 300       
 7. `MEM_FRACTION_STATIC` 用 0.95（低于 0.944 会报 "weights leave no GPU memory for the KV cache"）。
 8. 新增 `.env` 变量**必须补透传**（`patch_startsh_envvar.py`）；`bash -n` 查不出拼接错误，
    要实测 worker 行的 `-e` token 数并真实展开参数。
+9. **换 checkpoint 时最容易踩的两个静默坑**（2026-10-18 实测坐实，详见
+   [`docs/SWITCH-1017-LOCAL-WEIGHTS.md`](docs/SWITCH-1017-LOCAL-WEIGHTS.md)）：
+   - `dsv41-nfs` 是 `-v $MODEL_DIR:/export` 直接导出的，`share` 会**复用活容器**且
+     导出目录已有 48 分片时直接 return ⇒ 只改 `MODEL_DIR` 会让 head 读新权重、worker 读旧权重，
+     **所有检查全绿**。换模型前 `docker rm -f dsv41-nfs`，或用 `WEIGHT_MODE=local`。
+   - `pack_engram.py` 的幂等判断**只比文件尺寸**，而新旧 Engram 张量形状相同 ⇒ 尺寸必然相同
+     ⇒ 不 `rm -f` 旧分片就会静默沿用旧行表。**重建前必须删三台旧分片**。
+10. **GPU 降频锁死**（`PITFALLS.md` 第 28 行）：head 曾在 94% 利用率下恒 507 MHz
+   （node3 同 workload 2405 MHz），`-lgc`/`-rgc` 都无效，只能**断电 30–60 s**。
+   表现为单流只有参考值的 ~50%，很容易误判成模型变慢。
 
 ## 6. 仓库结构
 
@@ -264,6 +280,7 @@ docs/DEPLOY-RECORD-dsv41.md          现场主记录（按时间追加的历轮�
 docs/DEPLOY-GUIDE.md                 完整部署手册         docs/PITFALLS.md   避坑清单（按现象索引）
 docs/INDEXER-CHUNKED-TP3-RESULTS.md  ← 2026-09-26 indexer 移植实测（四臂 A/B、质量门、**负面结论**）
 docs/INDEXER-CHUNKED-TP3-PLAN.md     该移植的事前方案
+docs/SWITCH-1017-LOCAL-WEIGHTS.md   ← 2026-10-18 换 1017 + 三台本地权重（无 NFS）的实测记录
 docs/BATCH-MIGRATION-2026-09-25.md   2026-09-25 解码栈迁移实测   ADAPTER-MIGRATION-PLAN.md 其事前方
 docs/ROCE-INVESTIGATION.md           历史排查记录（已作废）      docs/UPSTREAM-ISSUE.md  上游 issue + 更正
 

@@ -7,8 +7,9 @@
 #   spark1 10.0.0.1 (mia)  — rank 0, API :8888
 #   spark2 10.0.0.2 (zurih)
 #   spark3 10.0.0.3 (zurih)
-#   TP=3 EP=3, RoCE NCCL, Engram on NVMe. spark2/spark3 read spark1 weights
-#   over NFSv4 on ConnectX (vllm-fn-nfs / dsv41-nfs) — no local 476 GiB copy.
+#   TP=3 EP=3, RoCE NCCL, Engram on NVMe. Two weight modes (WEIGHT_MODE):
+#     nfs   — spark2/spark3 read spark1's checkpoint over NFSv4 on ConnectX
+#     local — every node keeps its own checkpoint on local NVMe (no NFS at all)
 #
 # Usage:
 #   ./start.sh                 doctor → image → share → serve (default)
@@ -16,7 +17,8 @@
 #   ./start.sh pull            pull lmsysorg/sglang:dev-dsv41 on all 3 nodes
 #   ./start.sh build           docker build the Engram overlay image everywhere
 #   ./start.sh download        hf download the pinned V4.1-Flash revision
-#   ./start.sh share           export spark1 checkpoint; NFS volumes on spark2/3
+#   ./start.sh share           prepare weights on spark2/3 (NFS export or local rsync)
+#   ./start.sh sync            rsync the checkpoint to every node (WEIGHT_MODE=local)
 #   ./start.sh mount           alias for share (legacy)
 #   ./start.sh serve           launch workers then head
 #   ./start.sh stop            tear down all 3 ranks
@@ -139,8 +141,22 @@ REMOTE_PY="$ROOT/scripts/remote.py"
 NFS_VOLUME="${NFS_VOLUME:-dsv41-weights}"
 NFS_SHARE="${NFS_SHARE:-1}"
 
+# --- weight distribution ------------------------------------------------------
+# nfs   : spark2/3 mount the head checkpoint over NFSv4 (historical default).
+# local : every node keeps its own checkpoint on local NVMe; no NFS anywhere.
+#         Costs ~476 GiB/node but removes the head's single-disk supply
+#         bottleneck (measured 659 s to load TP0 when it also fed two workers
+#         over NFS) and the NFS round trip on every Engram miss.
+WEIGHT_MODE="${WEIGHT_MODE:-nfs}"
+WEIGHT_SYNC_JOBS="${WEIGHT_SYNC_JOBS:-8}"
+# local-mode rsync transport. The RoCE links are the only fast path: a single
+# ssh stream tops out near 90 MB/s (cipher-bound) and the management link is
+# WiFi, while 6-8 parallel aes-gcm streams give ~600-700 MB/s.
+WEIGHT_SYNC_SSH_OPTS="${WEIGHT_SYNC_SSH_OPTS:--o Compression=no -o StrictHostKeyChecking=accept-new -c aes256-gcm@openssh.com}"
+
 _abs() { readlink -f "$1" 2>/dev/null || echo "$1"; }
 MODEL_DIR="$(_abs "$MODEL_DIR")"
+WORKER_MODEL_DIR="$(_abs "${WORKER_MODEL_DIR:-$MODEL_DIR}")"
 SSH_IDENTITY="$(_abs "$SSH_IDENTITY")"
 NCCL_HOST_DIR="$(_abs "$NCCL_HOST_DIR")"
 
@@ -195,6 +211,58 @@ model_src() {
   else
     echo "$MODEL_DIR"
   fi
+}
+
+# --- local weight mode helpers -------------------------------------------------
+local_weights() { [[ "${WEIGHT_MODE:-nfs}" == "local" ]]; }
+
+worker_weight_path() { echo "${WORKER_MODEL_DIR:-$MODEL_DIR}"; }
+
+# "-v" spec that both modes mount at the container's fixed checkpoint path.
+# The container path never changes, so engine flags and .env stay untouched.
+worker_weight_mount() {
+  if local_weights; then
+    printf '%s:/models/DeepSeek-V4.1-Flash:ro' "$(worker_weight_path)"
+  else
+    printf '%s:/models/DeepSeek-V4.1-Flash:ro' "$NFS_VOLUME"
+  fi
+}
+
+# Total bytes of the top-level shards — cheap but exact completeness check.
+shard_bytes() {
+  find "$1" -maxdepth 1 -name 'model-*-of-*.safetensors' -printf '%s\n' 2>/dev/null \
+    | awk '{s+=$1} END{print s+0}'
+}
+
+# A worker is complete when config.json is there AND the shard byte total
+# matches the head's. Truncated/missing shards fail this without hashing 476 GiB.
+worker_has_local_model() {
+  local host="$1" dst want got
+  dst=$(worker_weight_path)
+  want=$(shard_bytes "$MODEL_DIR")
+  remote_ok_on "$host" "test -f $(printf '%q' "$dst")/config.json" || return 1
+  got=$(remote_on "$host" "find $(printf '%q' "$dst") -maxdepth 1 -name 'model-*-of-*.safetensors' -printf '%s\n' 2>/dev/null | awk '{s+=\$1} END{print s+0}'" 2>/dev/null | tr -d '\r' | tail -1)
+  [[ "${got:-0}" == "${want:-x}" ]]
+}
+
+# One worker, N concurrent rsync streams over the fabric (or management IP).
+_rsync_weights() {
+  local host="$1" dst="$2" jobs="${WEIGHT_SYNC_JOBS:-8}"
+  local -a files=() pids=()
+  mapfile -t files < <(cd "$MODEL_DIR" && find . -maxdepth 1 -type f -printf '%f\n' | sort)
+  local i k pid rc=0
+  for ((i = 0; i < jobs; i++)); do
+    (
+      for ((k = i; k < ${#files[@]}; k += jobs)); do
+        rsync -a --partial --inplace --no-compress \
+          -e "ssh $WEIGHT_SYNC_SSH_OPTS" \
+          "$MODEL_DIR/${files[k]}" "$host:$dst/" || exit 1
+      done
+    ) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  return "$rc"
 }
 
 api_key() {
@@ -469,14 +537,18 @@ cmd_doctor() {
     warn "RAM Engram mode pins ~189 GiB into unified memory — will not fit on Spark. Use nvme."
     ok=1
   fi
-  if nfs_rpc_ready 127.0.0.1; then
+  if local_weights; then
+    info "weights: WEIGHT_MODE=local — every node reads its own $(worker_weight_path) (no NFS)"
+  elif nfs_rpc_ready 127.0.0.1; then
     local _mounts="" _i
     for _i in "${!WORKER_HOSTS[@]}"; do _mounts+=" ${WORKER_HOSTS[$_i]}→$(nfs_server_ip_for "${WORKER_HOSTS[$_i]}" "$_i" 2>/dev/null || echo '?')"; done
     info "NFSv4 listening on this host (workers should mount CX7:${_mounts})"
   else
     warn "NFSv4 not listening yet — ./start.sh share will start or reuse the exporter"
   fi
-  info "weights: spark2/spark3 use docker NFS volume $NFS_VOLUME (head $MODEL_DIR); no rsync/SSHFS"
+  if ! local_weights; then
+    info "weights: spark2/spark3 use docker NFS volume $NFS_VOLUME (head $MODEL_DIR); no rsync/SSHFS"
+  fi
   if [[ "$TP_SIZE" -eq 3 ]]; then
     info "TP3 note: heads=64, o_groups=8, vocab=129280 are not divisible by 3; adapter/tp3_pad.py pads them"
     info "  (heads 64→96, groups 8→12, draft experts 128→129). experts=384 divides. Rank 2 holds padded shards only."
@@ -572,6 +644,11 @@ cmd_build() {
 }
 
 cmd_share() {
+  if local_weights; then
+    cmd_sync
+    info "WEIGHT_MODE=local: every node reads its own $(worker_weight_path) (no NFS)"
+    return 0
+  fi
   info "=== share spark1 checkpoint over NFSv4 on ConnectX ==="
   [[ -f "$MODEL_DIR/config.json" ]] || die "no checkpoint — ./start.sh download"
   ln -sfn "$MODEL_DIR" "$COMMON_MODEL"
@@ -592,8 +669,38 @@ cmd_share() {
 }
 cmd_mount() { cmd_share; }
 
+# Local weight mode: replicate the checkpoint onto every node over the fabric.
+# Idempotent — a node whose shard bytes already match the head is skipped, so
+# this is safe to re-run after an interrupted copy (rsync --partial resumes).
 cmd_sync() {
-  die "rsync of this 476 GiB checkpoint will not fit spark3. Use ./start.sh share (NFSv4 from spark1)."
+  [[ -f "$MODEL_DIR/config.json" ]] || die "no checkpoint on head — ./start.sh download"
+  local want
+  want=$(shard_bytes "$MODEL_DIR")
+  [[ "${want:-0}" -gt 0 ]] || die "head checkpoint has no shards"
+
+  ln -sfn "$MODEL_DIR" "$COMMON_MODEL"
+  ensure_ssh_keys
+
+  local -a fab=()
+  [[ -n "${WORKER_FABRIC_IPS:-}" ]] && read -r -a fab <<<"$(tr ',' ' ' <<<"$WORKER_FABRIC_IPS")"
+  local dst i=0 host ip
+  dst=$(worker_weight_path)
+  for host in "${WORKER_HOSTS[@]}"; do
+    ip="${fab[$i]:-${WORKER_IPS[$i]}}"
+    if worker_has_local_model "$host"; then
+      info "$host: local checkpoint already complete ($dst)"
+      i=$((i + 1))
+      continue
+    fi
+    info "syncing $MODEL_DIR → $host:$dst (via $ip, ${WEIGHT_SYNC_JOBS:-8} streams)"
+    remote_on "$host" "mkdir -p $(printf '%q' "$dst")" || die "cannot create $dst on $host"
+    _rsync_weights "$ip" "$dst" \
+      || die "rsync to $host failed — re-run ./start.sh sync to resume (rsync --partial)"
+    worker_has_local_model "$host" || die "$host still incomplete after rsync (size mismatch)"
+    info "$host: local checkpoint complete (${want} shard bytes = $((want / 1073741824)) GiB)"
+    i=$((i + 1))
+  done
+  info "all ${#WORKER_HOSTS[@]} workers hold a complete local checkpoint"
 }
 
 _busy_gpu() {
@@ -615,7 +722,7 @@ cmd_serve() {
 
   local h need_share=0
   for h in "${WORKER_HOSTS[@]}"; do
-    if ! nfs_worker_has_model "$h"; then
+    if ! local_weights && ! nfs_worker_has_model "$h"; then
       need_share=1
     fi
     if ! remote_ok_on "$h" "docker image inspect $(printf '%q' "$IMAGE") >/dev/null 2>&1"; then
@@ -624,7 +731,11 @@ cmd_serve() {
       break
     fi
   done
-  if [[ "$need_share" -eq 1 || "$NFS_SHARE" == "1" ]]; then
+  if local_weights; then
+    # cmd_share == cmd_sync in local mode: verifies each node's copy, copies
+    # only what is missing (idempotent).
+    cmd_share
+  elif [[ "$need_share" -eq 1 || "$NFS_SHARE" == "1" ]]; then
     cmd_share
   fi
 
@@ -659,9 +770,17 @@ cmd_serve() {
     wip="${WORKER_IPS[$idx]}"
     wgid="${WORKER_GIDS[$idx]}"
     rank=$((idx + 1))
+    local wguard wmount
+    if local_weights; then
+      wguard="test -f $(printf '%q' "$(worker_weight_path)")/config.json || { echo 'MISSING local checkpoint on $h — ./start.sh sync'; exit 1; }"
+      wmount="$(worker_weight_path):/models/DeepSeek-V4.1-Flash:ro"
+    else
+      wguard="docker volume inspect $NFS_VOLUME >/dev/null || { echo 'MISSING docker volume $NFS_VOLUME on $h — run ./start.sh share'; exit 1; }"
+      wmount="$NFS_VOLUME:/models/DeepSeek-V4.1-Flash:ro"
+    fi
     remote_on "$h" "
       set -e
-      docker volume inspect $NFS_VOLUME >/dev/null || { echo 'MISSING docker volume $NFS_VOLUME on $h — run ./start.sh share'; exit 1; }
+      $wguard
       test -d /dev/infiniband || { echo 'MISSING /dev/infiniband on $h'; exit 1; }
       mkdir -p $WORKER_DIR/state $WORKER_DIR/logs
       NCCL_VOL=''
@@ -675,7 +794,7 @@ cmd_serve() {
         --shm-size ${SHM_SIZE:-32g} \
         --ulimit memlock=-1:-1 --ulimit stack=67108864 \
         --device /dev/infiniband:/dev/infiniband \
-        -v $NFS_VOLUME:/models/DeepSeek-V4.1-Flash:ro \
+        -v $wmount \
         -v $WORKER_DIR/state:/state \
         -v \$HOME/.cache:/root/.cache \
         \$NCCL_VOL \$NCCL_ENV \\
@@ -800,10 +919,11 @@ cmd_status() {
   echo "== head =="
   docker ps --filter "name=$HEAD_CTN" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' || true
   echo
-  local h
+  local h wp
   for h in "${WORKER_HOSTS[@]}"; do
     echo "== worker $h =="
-    remote_on "$h" "docker ps --filter name=$WORKER_CTN --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' ; test -f $COMMON_MODEL/config.json && echo weights:OK || echo weights:MISSING" || warn "status SSH $h failed"
+    if local_weights; then wp=$(worker_weight_path); else wp="$COMMON_MODEL"; fi
+    remote_on "$h" "docker ps --filter name=$WORKER_CTN --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' ; test -f $(printf '%q' "$wp")/config.json && echo weights:OK || echo weights:MISSING" || warn "status SSH $h failed"
     echo
   done
   echo "== API =="
@@ -861,6 +981,13 @@ shift || true
 cmd_pack() {
   local src
   src=$(model_src)
+  local existing
+  existing=$(find "$ENGRAM_DIR" -maxdepth 1 -name 'engram-l*.bin' 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "${existing:-0}" -gt 0 ]]; then
+    warn "existing Engram shards in $ENGRAM_DIR ($existing files)"
+    warn "pack_engram.py skips a shard when its SIZE already matches — after a checkpoint"
+    warn "change that is silently the OLD row table. Delete them first: rm -f $ENGRAM_DIR/engram-l*.bin"
+  fi
   info "packing Engram shards: head $ENGRAM_DIR, workers $WORKER_ENGRAM_DIR"
   mkdir -p "$ENGRAM_DIR"
   docker run --rm --network host \
@@ -870,11 +997,17 @@ cmd_pack() {
     --entrypoint python3 "$IMAGE" \
     /opt/dsv41/scripts/pack_engram.py --rank 0 --tp "$TP_SIZE" --out /engram \
     || die "pack failed on head"
-  local idx=1 host
-  for host in "${WORKER_IPS[@]}"; do
-    info "packing rank $idx on $host..."
+  local idx=1 host wmount
+  for host in "${WORKER_HOSTS[@]}"; do
+    if local_weights; then
+      wmount="$(worker_weight_path)"
+      info "packing rank $idx on $host (local source)..."
+    else
+      wmount="$NFS_VOLUME"
+      info "packing rank $idx on $host (NFS source)..."
+    fi
     remote_on "$host" "mkdir -p $WORKER_ENGRAM_DIR && docker run --rm --network host \
-      -v $NFS_VOLUME:/models/DeepSeek-V4.1-Flash:ro \
+      -v $wmount:/models/DeepSeek-V4.1-Flash:ro \
       -v $WORKER_ENGRAM_DIR:/engram \
       -e DSV41_SOURCE=/models/DeepSeek-V4.1-Flash \
       --entrypoint python3 $IMAGE \
