@@ -13,6 +13,8 @@
 # 判据：负载下 util ≥ 50% 且 SM 中位时钟 < 1200 MHz ⇒ 打 ✗（锁死/未升频）。
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
+# 允许两种调用：./check-gpu-clocks.sh（部署根）与 ./scripts/check-gpu-clocks.sh
+if [ ! -f .env ] && [ -f ../.env ]; then cd .. || exit 1; fi
 [ -f .env ] && { set -a; . ./.env; set +a; }
 
 MODE=load
@@ -22,8 +24,19 @@ SECS=${2:-6}
 THRESH=${CLOCK_MIN_MHZ:-1200}
 
 SELF=$(hostname)
+# SSH 目标优先用 WORKER_IPS（管理网地址）：fq-dgx-02.local 这类名字可能经 mDNS
+# 解析到织网地址，而织网口上的 sshd 不一定监听。与 start.sh 的选择保持一致。
 read -r -a WORKERS <<<"${WORKER_HOSTS:-}"
+read -r -a WIPS <<<"${WORKER_IPS:-}"
 NODES=("$SELF" "${WORKERS[@]}")
+SSH_TARGETS=("$SELF")
+for i in "${!WORKERS[@]}"; do SSH_TARGETS+=("${WIPS[$i]:-${WORKERS[$i]}}"); done
+
+# 集群用专用密钥（.env 的 SSH_IDENTITY），普通 ssh 的默认密钥在 worker 上通常未授权
+SSH_OPTS=(-o ConnectTimeout=6 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+if [ -n "${SSH_IDENTITY:-}" ] && [ -f "${SSH_IDENTITY}" ]; then
+  SSH_OPTS+=(-i "$SSH_IDENTITY" -o IdentitiesOnly=yes)
+fi
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
@@ -32,7 +45,7 @@ sample_one() {  # host outfile
   if [ "$h" = "$SELF" ]; then
     timeout "$((SECS + 2))" nvidia-smi --query-gpu=clocks.sm,utilization.gpu --format=csv,noheader -lms 250 >"$out" 2>/dev/null
   else
-    ssh -o ConnectTimeout=6 -o BatchMode=yes "$h" \
+    ssh "${SSH_OPTS[@]}" "$h" \
       "timeout $((SECS + 2)) nvidia-smi --query-gpu=clocks.sm,utilization.gpu --format=csv,noheader -lms 250" >"$out" 2>/dev/null
   fi
 }
@@ -56,7 +69,7 @@ fi
 echo "=== GPU 时钟体检 $(date '+%F %T')  模式=$MODE  时长=${SECS}s ==="
 samp_pids=()
 for i in "${!NODES[@]}"; do
-  sample_one "${NODES[$i]}" "$tmp/n$i.txt" &
+  sample_one "${SSH_TARGETS[$i]}" "$tmp/n$i.txt" &
   samp_pids+=($!)
 done
 for p in "${samp_pids[@]}"; do wait "$p"; done
