@@ -310,5 +310,34 @@ ssh fq-dgx-03.local 'rm -f ~/dsv41-3xspark/engram/engram-l*-r2of3.bin'
 - **长上下文未重测**：`CHUNKED_PREFILL_SIZE=1024` 的保护上界是针对旧权重的；
   上游「~200k prompt 打爆 Spark 主机」的失败模式仍未在 1017 上验证。
 - **工具调用未在 1017 上验证**（`tool_call_parser=deepseekv41`）。
-- **清理未做**：旧权重 476+244+233 G、`~/.cache/huggingface/export` 硬链接（第三份 inode）、
-  ModelScope 缓存里的 Qwen3.8-Flash-Next 336 G + GLM-5.3-Flash 306 G。
+- **清理已完成**（2026-10-18 08:53，见 §10）。旧权重已删除 ⇒ **回滚路径也随之关闭**
+  （用户此前已明确不考虑回滚）。
+
+## 10. 磁盘清理（2026-10-18 08:53）
+
+删除前先做的三项核对：① 三个旧权重路径 `stat` 同一 inode、links=3（必须一起删才回收）；
+② 运行中容器挂载中 `NewModels` 计数为 0；③ 服务脚本对 `NewModels` 的唯一引用是
+`start.sh:84` 的默认值（`.env` 已覆盖，不影响运行）。
+
+| 位置 | 删除内容 | 回收 |
+|---|---|---|
+| head | `~/NewModels`、`~/.cache/huggingface/dsv41-native`、`~/.cache/huggingface/export`（同一 476 G 的三条硬链接） | **476 G** |
+| head | `~/.cache/modelscope/models/Qwen--Qwen3.8-Flash-Next` | **336 G** |
+| head | `~/.cache/modelscope/models/ZhipuAI--GLM-5.3-Flash` | **306 G** |
+| head | `.../deepseek-ai--DeepSeek-V4-Flash-0731`（空目录） | 8 K |
+| node2 | `~/NewModels`（旧权重残留） | **244 G** |
+| node3 | `~/NewModels`（旧权重残留） | **233 G** |
+
+结果：
+
+| 节点 | 删除前 已用/可用 | 删除后 已用/可用 |
+|---|---|---|
+| head | 2.2 T / 1.4 T | **1.1 T / 2.5 T** |
+| node2 | 1.3 T / 2.3 T | **1010 G / 2.5 T** |
+| node3 | 954 G / 786 G | **722 G / 1018 G** |
+
+合计回收约 **1.6 T**。删除后复查：三台新权重均 48/48 分片、476 G 在位，
+`/var/tmp/DeepSeek-V4.1-Flash` 指向 1017，`/health=200`，worker 容器 healthy。
+
+> 保留未动：`~/nccl*` 与两个 9-17 的 `.bak`（合计约 1.2 G，NCCL 版本备份）、
+> `~/modelscope-venv`、serve 日志。需要更彻底可再处理。
