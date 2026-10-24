@@ -1,0 +1,17 @@
+[Unit]
+Description=DeepSeek-V4.1-Flash 3x DGX Spark health watchdog (whole-cluster restart)
+Documentation=file:///home/fuqiang/dsv41-3xspark/README.md
+After=docker.service network-online.target
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=fuqiang
+WorkingDirectory=/home/fuqiang/dsv41-3xspark
+ExecStart=/home/fuqiang/dsv41-3xspark/watchdog.sh
+# 一次整集群 restart 约 10–20 分钟（stop + share + 权重加载 + 图捕获 + 等 health）
+TimeoutStartSec=3600
+# 只杀 watchdog 自身，不要连带杀掉它起的 serve 进程树
+KillMode=process
+StandardOutput=append:/home/fuqiang/dsv41-3xspark/logs/watchdog.log
+StandardError=append:/home/fuqiang/dsv41-3xspark/logs/watchdog.log

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run DSV4.1 health watchdog every 2 minutes
+
+[Timer]
+# 开机后不要立刻插手（svc-boot.sh / dsv41.service 还在起服）
+OnBootSec=10min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=dsv41-watchdog.service
+
+[Install]
+WantedBy=timers.target

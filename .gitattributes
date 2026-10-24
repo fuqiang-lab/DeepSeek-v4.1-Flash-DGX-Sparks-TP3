@@ -5,3 +5,10 @@
 # 这里把 fleet/ 下所有文件钉成 LF：仓库内与任何平台检出后都是 LF。
 fleet/*   text eol=lf
 fleet/**  text eol=lf
+
+# ── scripts/dsv41-watchdog.*：同样要 scp 到 head 直接运行（.sh 由 systemd 调起）──────
+# 只钉这三个新文件；scripts/ 下其它 .sh 有同样的 CRLF 风险，尚未统一
+# （2026-10-25 事件复盘 §8 已记录该待办）
+scripts/dsv41-watchdog.sh      text eol=lf
+scripts/dsv41-watchdog.service text eol=lf
+scripts/dsv41-watchdog.timer   text eol=lf
