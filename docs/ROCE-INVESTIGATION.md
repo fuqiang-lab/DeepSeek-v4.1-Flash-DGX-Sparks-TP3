@@ -179,7 +179,7 @@ rank2 (node3): rocep1s0f0,rocep1s0f1   → idx0 = p0(178.1)→W1→head ；idx1 
 - 降级驱动后，**当前内核的驱动模块会被卸掉** → 若这时误重启到旧内核，会得到"有系统没显卡"（ssh 可用，可恢复）。
 - 脚本经 ssh 分发时文件名要一致；`setsid sudo -n bash /绝对路径` 才能真脱离会话（`~` 在引号里的变量中不展开）。
 
-**提交上游 issue（已完成）**：2026-09-18 20:00 发布 → [`luxingcom/aicad-nccl-optimization#1`](https://github.com/luxingcom/aicad-nccl-optimization/issues/1)（标题：3 节点三角应用 v1+v4 补丁栈后 QP110 消失但 all_reduce 仍撞 `net_ib/p2p.cc:703`；含环境表、最小复现、补丁生效证据、11 项已排除变量表、两点观察、三个具体问题）。草稿留档 `UPSTREAM-ISSUE-aicad-3node-triangle.md`；发布走 GitHub OAuth 设备码（作用域 `public_repo`），令牌未落盘。账号：`masquerator-coder`。
+**提交上游 issue（已完成）**：2026-09-18 20:00 发布 → [`luxingcom/aicad-nccl-optimization#1`](https://github.com/luxingcom/aicad-nccl-optimization/issues/1)（标题：3 节点三角应用 v1+v4 补丁栈后 QP110 消失但 all_reduce 仍撞 `net_ib/p2p.cc:703`；含环境表、最小复现、补丁生效证据、11 项已排除变量表、两点观察、三个具体问题）。草稿留档 `UPSTREAM-ISSUE-aicad-3node-triangle.md`；发布走 GitHub OAuth 设备码（作用域 `public_repo`），令牌未落盘。账号：`fuqiang-lab`。
 
 ## 下一步候选（未验证完）
 1. **`NCCL_IB_MERGE_NICS=1` + 全部 4 个口 + SUBNET_AWARE=1 + 不设 CROSS_NIC**（本次 smoke 在引擎占用 GPU 时挂住，未取到结论）→ 需**停引擎后**重跑，这是三角拓扑下唯一形状正确的方案。

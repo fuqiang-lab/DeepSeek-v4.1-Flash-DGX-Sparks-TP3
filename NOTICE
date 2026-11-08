@@ -5,7 +5,7 @@ DeepSeek-V4.1-Flash · 3× DGX Spark 部署记录（DeepSeek-v4.1-Flash-DGX-Spar
 ----------------
 
 1) 本仓库自身内容（docs/、scripts/、assets/、README 等）
-   MIT License —— 见 LICENSE。Copyright (c) 2026 masquerator-coder。
+   MIT License —— 见 LICENSE。Copyright (c) 2026 fuqiang-lab。
 
 2) fleet/ 目录（含 fleet/adapter/）
    GNU Affero General Public License v3.0 or later（AGPL-3.0-or-later）——
