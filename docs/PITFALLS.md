@@ -129,6 +129,7 @@ V4.1 这个 build 的 `text_config` 是 dict 类型，dict 形式会**整体替�
 | 长上下文直接崩 | `persistent_topk` 过订阅 48 个 SM，其 fallback 需 **128 KB** shared memory，而 GB10 只有 **99 KB** | 改用 `top_k_per_row_decode`（顺带快 1.6–3.6×） |
 | 投机 batch 挂死 | adaptive verification 会 pad 投机 batch，padded batch 会 hang SM120 sparse MLA | **adaptive verification 保持关闭** |
 | decode warmup 起不来 | FlashInfer 0.6.18 在 SM120 没有 `page_block_size=32` 的 sparse-MLA decode kernel | 升级 FlashInfer + SM12x page 补丁 |
+| 运行期**三机同时沉默**（Engram 60s 统计 + detokenizer 心跳齐停）→ ~10 分钟内三容器连环退出【实测 2026-10-23，未定案】 | TP device 组一条 ALLREDUCE 600s 未开始（watchdog `last started work: -1`）→ TP 锁步下全 rank 队列堵死、进程冻结；传输瞬时异常 vs 引擎栈死锁二选一无证据（原始现场因容器被 stop 而丢失） | 症状一出现先**保全现场**再恢复：按 [`INCIDENT-2026-10-23-ALLREDUCE-STALL.md`](INCIDENT-2026-10-23-ALLREDUCE-STALL.md) §6 执行（docker logs 落盘 → journalctl -k → 再 svc.sh stop/start）；并加 `NCCL_DEBUG=INFO`、`crash-dump-folder` 观测 |
 
 ### 3.4 重启动竞态
 

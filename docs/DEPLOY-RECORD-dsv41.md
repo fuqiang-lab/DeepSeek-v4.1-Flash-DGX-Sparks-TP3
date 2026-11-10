@@ -106,11 +106,20 @@ nvidia-smi --query-gpu=driver_version --format=csv,noheader   # 期望 580.173.0
 - 切换/回滚：`~/dsv41-3xspark/kernel_switch2.sh`（会先缓存 178.04 全套回滚包，可离线回滚）。
 - **固化**（否则一次普通重启就回到坏内核，且旧内核此时已没有驱动模块）：
   ```bash
+  # ⚠️ 这是"位置参数"，下标随每台机器的内核列表而变，且任何 OTA 都可能把它顶偏。
+  #    改任何内核之后必须先核对：grep 'set default' /boot/grub/grub.cfg + 子菜单序号。
   sudo sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT="1>2"/' /etc/default/grub   # 1=Advanced 子菜单，2=6.17.0-1031 项（0 基）
   sudo update-grub
   sudo apt-mark hold nvidia-kernel-common-580 nvidia-utils-580 libnvidia-compute-580 \
-       nvidia-kernel-source-580-open linux-image-7.0.0-1019-nvidia linux-image-nvidia-hwe-24.04
+       nvidia-kernel-source-580-open linux-image-7.0.0-1019-nvidia linux-image-nvidia-hwe-24.04 \
+       linux-image-6.17.0-1031-nvidia linux-modules-6.17.0-1031-nvidia \
+       linux-modules-nvidia-580-open-6.17.0-1031-nvidia     # 2026-11-10 补：钉住已知好内核三件套
   ```
+  **2026-11-10 事故**：DGX OTA 26.09.3 装了 `linux-image-7.0.0-1025-nvidia`，新内核插到子菜单最前，
+  `1>2` 从 6.17 漂到 7.0.0-1019（无 nvidia 模块 + `CmaTotal=0`）→ head/02 起不来，服务 rc=1。
+  修法与细节见 [`INCIDENT-2026-11-10-KERNEL-PIN-DRIFT.md`](INCIDENT-2026-11-10-KERNEL-PIN-DRIFT.md)。
+  **绝不装 `linux-modules-nvidia-580-open-7.0.0-1025-nvidia`**（依赖 `nvidia-kernel-common-580 >= 580.178.04`，
+  一升就把 6.17 的 173.02 模块配对弄坏）。
 - 驱动与内核是**配对**的：`173.02 ↔ 6.17.0-1031`、`178.04 ↔ 7.0.0-1019`。降级驱动会**卸掉当前内核的驱动模块**，所以"降驱动 + 一次性引导到旧内核"必须成对做，别只做一半。
 
 ### 2) 修共享（每次重启机器后第一步）

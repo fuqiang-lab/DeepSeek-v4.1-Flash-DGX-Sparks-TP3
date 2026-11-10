@@ -17,6 +17,9 @@
 #   3) 绝不用 docker ps -q | xargs docker rm -f（引擎容器也在列表里）
 #   4) 起服务前必须确认三台 GPU 空闲：上一轮残留会让这一轮假失败
 #   5) 同一处反复失败 → 先重启三台再重试
+#   6) 数"GPU 计算进程"必须过滤非数字行：nvidia-smi 失败时把报错打在 stdout，
+#      wc -l 会数成 2 → 驱动一挂就误报"2 个残留进程"（2026-11-10 事故踩过）
+#   7) /health 判据必须带 --retry：刚起服后有约 40s 无响应窗口，单次 curl 会误判
 # =============================================================================
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -47,6 +50,15 @@ node_do() { local h=$1; shift
   if [ "$h" = "localhost" ] || [ "$h" = "$SELF" ]; then bash -c "$*"; else $SSH "$h" "$*"; fi; }
 newest_log() { ls -t serve-*.log 2>/dev/null | head -1; }
 ib_mode() { [ "${NCCL_NET:-Socket}" = "IB" ] && echo 1 || echo 0; }
+# GPU 计算进程数：只认纯数字行。nvidia-smi 与驱动失联时把错误信息打到 stdout，
+# 直接 wc -l 会数成 2 条（2026-11-10 实测）→ 误报"有 2 个残留进程"。
+# 用 if 而不是 `a && b || c`：grep -q 无匹配时 `&&` 不执行，要靠 `||` 兜底，语义正确
+gpu_procs_known() { if sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
+  | grep -qE '^[0-9]+$'; then echo 1; else echo 0; fi; }   # 1 = 计数可信
+# 健康探测（默认重试 3 次）：刚起服后有 ~40s 无响应窗口，单次 curl 会误判（2026-11-10 实测）。
+# 注意 --retry-connrefused 只对"连接被拒"生效，不会把超时/IP 不可达也拖长；不用 --retry-all-errors。
+hprobe() { curl -fsS --retry "${H_RETRY:-3}" --retry-delay 2 --retry-connrefused -m "${H_TIMEOUT:-5}" \
+  "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; }
 
 # =============================================================================
 preflight() {
@@ -73,7 +85,8 @@ preflight() {
 
   for h in "${NODES[@]}"; do
     out=$(node_do "$h" 'ls -1 /etc/nvidia/ 2>/dev/null | grep -qi cx7-hotplug-enabled && echo X=1 || echo X=0; \
-      echo A=$(sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l); \
+      echo A=$(sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -cE "^[0-9]+$"); \
+      echo K=$(sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -qE "^[0-9]+$" && echo 1 || echo 0); \
       echo U=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader 2>/dev/null | head -1 | tr -d " "); \
       echo D=$(docker ps --format {{.Names}} 2>/dev/null | grep -cE "^dsv41-(head|worker)$" || true)')
     get() { echo "$out" | sed -n "s/^$1=//p" | head -1; }
@@ -82,8 +95,13 @@ preflight() {
       warn "$h: 服务正在运行（$(get D) 个 dsv41 容器；$(get A) 个计算进程属于它）"
       SERVICE_RUNNING=1
     else
-      [ "$(get A)" = "0" ] && ok "$h: 无 GPU 计算进程" \
-        || bad "$h: 有 $(get A) 个 GPU 计算进程残留（会让本轮假失败 → 重启该机）"
+      a=$(get A); a=${a:-0}
+      # K=0 表示 nvidia-smi 拿不到计算进程列表（多半是驱动/内核不对）→ 不下"有残留"的结论，
+      # 否则会被一个假数字带去"重启该机"，掩盖真正原因（2026-11-10 实测）。
+      if [ "$a" = "0" ]; then ok "$h: 无 GPU 计算进程"
+      elif [ "$(get K)" = "1" ]; then bad "$h: 有 $a 个 GPU 计算进程残留（会让本轮假失败 → 重启该机）"
+      else bad "$h: nvidia-smi 报不出计算进程（驱动异常？）—— 先查内核/驱动，别急着重启"
+      fi
       info "$h: GPU $(get U)"
     fi
     if [ "$(ib_mode)" = 1 ]; then
@@ -142,7 +160,7 @@ do_serve() {
 verify() {
   local log=${1:-$(newest_log)}
   hr; echo "${c_b}[5/5] 三层验证${c_0}"; FAILED=0
-  local ibl=$(curl -s -m 5 "http://127.0.0.1:${PORT}/health" -w ' %{http_code}' 2>/dev/null)
+  local ibl=$(curl -s --retry 3 --retry-delay 2 --retry-connrefused -m 5 "http://127.0.0.1:${PORT}/health" -w ' %{http_code}' 2>/dev/null)
   echo "$ibl" | grep -q '200' && ok "① /health = 200" || bad "① /health 异常：$ibl"
 
   m=$(curl -s -m 8 "http://127.0.0.1:${PORT}/v1/models" | python3 -c 'import sys,json;d=json.load(sys.stdin)["data"][0];print(d["id"],d.get("max_model_len"))' 2>/dev/null)
@@ -206,9 +224,12 @@ cmd_stop() {
   local left=0 h s a
   for h in "${NODES[@]}"; do
     s=$(node_do "$h" 'docker ps --format {{.Names}} 2>/dev/null | grep -E "^dsv41-(head|worker)$" | tr "\n" " "')
-    a=$(node_do "$h" 'sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l')
+    a=$(node_do "$h" 'sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -cE "^[0-9]+$"'); a=${a:-0}
+    k=$(node_do "$h" 'sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -qE "^[0-9]+$" && echo 1 || echo 0')
     if [ -n "${s// /}" ]; then bad "$h 仍有引擎容器：$s"; left=1; else ok "$h 无引擎容器（dsv41-head/worker）"; fi
-    if [ "${a:-0}" = "0" ]; then ok "$h GPU 无计算进程"; else bad "$h 仍有 $a 个 GPU 计算进程"; left=1; fi
+    if [ "$a" = "0" ]; then ok "$h GPU 无计算进程"
+    elif [ "$k" = "1" ]; then bad "$h 仍有 $a 个 GPU 计算进程"; left=1
+    else warn "$h nvidia-smi 无法列出计算进程（驱动异常？），跳过该项判定"; fi
   done
   if [ "$left" = 1 ]; then
     echo; echo "  残留清理（${c_r}按确切名字${c_0}；绝不要 docker ps -q | xargs docker rm -f）："

@@ -180,7 +180,7 @@ python3 scripts/arp_probe.py
 
 | # | 问题 | 判据 | 修法 |
 |---|---|---|---|
-| ① | **内核 CMA 回归**：`7.0.0-1019-nvidia` 上 `ibv_reg_mr_iova2` 必然 `Cannot allocate memory`（连 1 KB 都失败）⇒ 引擎建后续 communicator 时 `ncclSystemError` | `grep CmaTotal /proc/meminfo` = **`0 kB`**（正常 `131072 kB`） | 内核/驱动换到 **`6.17.0-1031-nvidia` + `580.173.02`**；`GRUB_DEFAULT="1>2"` + `update-grub` + `apt-mark hold` 防升回 |
+| ① | **内核 CMA 回归**：`7.0.0-1019-nvidia` 上 `ibv_reg_mr_iova2` 必然 `Cannot allocate memory`（连 1 KB 都失败）⇒ 引擎建后续 communicator 时 `ncclSystemError` | `grep CmaTotal /proc/meminfo` = **`0 kB`**（正常 `131072 kB`） | 内核/驱动换到 **`6.17.0-1031-nvidia` + `580.173.02`**；`GRUB_DEFAULT="1>2"` + `update-grub` + `apt-mark hold` 防升回（**位置参数会随 OTA 插新内核而漂移，改完必须核对 `grep 'set default' /boot/grub/grub.cfg`**，见 [内核钉偏事故](docs/INCIDENT-2026-11-10-KERNEL-PIN-DRIFT.md)） |
 | ② | **引擎镜像 `/etc/nccl.conf` 残留**：`NCCL_IB_USE_INLINE=1` + `NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS=1` ⇒ pynccl 的 **4 字节** warmup all_reduce 永久冻死（日志停在 `sglang is using nccl==2.30.7`，GPU 96% 但功耗仅 ~16 W 自旋） | `docker exec <容器> cat /etc/nccl.conf` | `start.sh` 补透传并置 0：`patch_startsh_envvar.py NCCL_IB_USE_INLINE 0`、`... NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS 0`（**进程 env 优先于 conf 文件**）|
 
 > ② 的关键排查经验：所有"能通过"的独立 smoke/探针跑的**都是基础镜像**（不带该文件），
@@ -281,6 +281,7 @@ docs/DEPLOY-GUIDE.md                 完整部署手册         docs/PITFALLS.md
 docs/INDEXER-CHUNKED-TP3-RESULTS.md  ← 2026-09-26 indexer 移植实测（四臂 A/B、质量门、**负面结论**）
 docs/INDEXER-CHUNKED-TP3-PLAN.md     该移植的事前方案
 docs/SWITCH-1017-LOCAL-WEIGHTS.md   ← 2026-10-18 换 1017 + 三台本地权重（无 NFS）的实测记录
+docs/INCIDENT-2026-10-23-ALLREDUCE-STALL.md ← 2026-10-23 运行期 TP 全 rank 集合通信停滞事件（未定案，含复现预案）
 docs/BATCH-MIGRATION-2026-09-25.md   2026-09-25 解码栈迁移实测   ADAPTER-MIGRATION-PLAN.md 其事前方
 docs/ROCE-INVESTIGATION.md           历史排查记录（已作废）      docs/UPSTREAM-ISSUE.md  上游 issue + 更正
 

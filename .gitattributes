@@ -12,3 +12,9 @@ fleet/**  text eol=lf
 scripts/dsv41-watchdog.sh      text eol=lf
 scripts/dsv41-watchdog.service text eol=lf
 scripts/dsv41-watchdog.timer   text eol=lf
+
+# ── svc.sh / svc-boot.sh / dsv41.service：要 scp 到 head 直接跑（2026-11-10 补钉）
+# 本事件里就是用 CRLF 的 svc.sh 上传后靠 sed 's/\r$//' 才没炸，别再依赖这个手工步骤。
+scripts/svc.sh          text eol=lf
+scripts/svc-boot.sh     text eol=lf
+scripts/dsv41.service   text eol=lf
